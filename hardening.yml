@@ -1,0 +1,184 @@
+---
+- name: Hardening complet Debian + Rocky
+  hosts: all
+  become: true
+  tasks:
+    # --- SSH ---
+    - name: SSH - PermitRootLogin no
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PermitRootLogin'
+        line: 'PermitRootLogin no'
+      notify: Redemarrer sshd
+    - name: SSH - MaxAuthTries 3
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?MaxAuthTries'
+        line: 'MaxAuthTries 3'
+      notify: Redemarrer sshd
+    - name: SSH - X11Forwarding no
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?X11Forwarding'
+        line: 'X11Forwarding no'
+      notify: Redemarrer sshd
+    # --- PAM / password aging ---
+    - name: PAM - PASS_MAX_DAYS 90
+      lineinfile:
+        path: /etc/login.defs
+        regexp: '^PASS_MAX_DAYS'
+        line: 'PASS_MAX_DAYS   90'
+    - name: PAM - PASS_MIN_DAYS 1
+      lineinfile:
+        path: /etc/login.defs
+        regexp: '^PASS_MIN_DAYS'
+        line: 'PASS_MIN_DAYS   1'
+    # --- Kernel sysctl ---
+    - name: Sysctl - rp_filter
+      sysctl:
+        name: net.ipv4.conf.all.rp_filter
+        value: '1'
+        sysctl_set: true
+        state: present
+        reload: true
+    - name: Sysctl - tcp_syncookies
+      sysctl:
+        name: net.ipv4.tcp_syncookies
+        value: '1'
+        sysctl_set: true
+        state: present
+        reload: true
+    - name: Sysctl - accept_redirects
+      sysctl:
+        name: net.ipv4.conf.all.accept_redirects
+        value: '0'
+        sysctl_set: true
+        state: present
+        reload: true
+    # --- Sudo ---
+    - name: Sudo - timestamp_timeout reduit
+      copy:
+        dest: /etc/sudoers.d/99-timeout
+        content: "Defaults timestamp_timeout=1\n"
+        mode: '0440'
+        validate: 'visudo -cf %s'
+    # --- AIDE ---
+    - name: AIDE - installation
+      package:
+        name: aide
+        state: present
+    - name: AIDE - initialisation base
+      command: aideinit
+      args:
+        creates: /var/lib/aide/aide.db.new
+    - name: AIDE - activation base
+      command: cp /var/lib/aide/aide.db.new /var/lib/aide/aide.db
+      args:
+        creates: /var/lib/aide/aide.db
+    # --- auditd ---
+    - name: Auditd - installation
+      package:
+        name: auditd
+        state: present
+      when: ansible_facts['os_family'] == "Debian"
+    - name: Auditd - regle passwd
+      lineinfile:
+        path: /etc/audit/rules.d/hardening.rules
+        line: '-w /etc/passwd -p wa -k identity'
+        create: true
+      notify: Recharger auditd
+    - name: Auditd - regle sudoers
+      lineinfile:
+        path: /etc/audit/rules.d/hardening.rules
+        line: '-w /etc/sudoers -p wa -k privilege_escalation'
+        create: true
+      notify: Recharger auditd
+    - name: Auditd - regle sshd_config
+      lineinfile:
+        path: /etc/audit/rules.d/hardening.rules
+        line: '-w /etc/ssh/sshd_config -p wa -k sshd_config'
+        create: true
+      notify: Recharger auditd
+    - name: Auditd - regle shadow
+      lineinfile:
+        path: /etc/audit/rules.d/hardening.rules
+        line: '-w /etc/shadow -p wa -k identity'
+        create: true
+      notify: Recharger auditd
+    - name: Auditd - regle root_commands
+      lineinfile:
+        path: /etc/audit/rules.d/hardening.rules
+        line: '-a always,exit -F arch=b64 -S execve -F euid=0 -k root_commands'
+        create: true
+      notify: Recharger auditd
+    - name: Auditd - regle time_change
+      lineinfile:
+        path: /etc/audit/rules.d/hardening.rules
+        line: '-a always,exit -F arch=b64 -S adjtimex -S settimeofday -k time_change'
+        create: true
+      notify: Recharger auditd
+    # --- pwquality ---
+    - name: Pwquality - installation
+      package:
+        name: libpam-pwquality
+        state: present
+      when: ansible_facts['os_family'] == "Debian"
+    - name: Pwquality - longueur minimale
+      lineinfile:
+        path: /etc/security/pwquality.conf
+        regexp: '^minlen'
+        line: 'minlen = 12'
+    - name: Pwquality - classes de caracteres
+      lineinfile:
+        path: /etc/security/pwquality.conf
+        regexp: '^minclass'
+        line: 'minclass = 4'
+    # --- Firewall nftables ---
+    - name: Firewall - installation nftables
+      package:
+        name: nftables
+        state: present
+    - name: Firewall - modules noyau au demarrage
+      lineinfile:
+        path: /etc/modules
+        line: "{{ item }}"
+        create: true
+      loop:
+        - nf_tables
+        - nf_conntrack
+        - nft_ct
+    - name: Firewall - charger modules immediatement
+      command: modprobe {{ item }}
+      loop:
+        - nf_tables
+        - nf_conntrack
+        - nft_ct
+    - name: Firewall - deployer la config
+      copy:
+        dest: /etc/nftables.conf
+        content: |
+          table inet filter {
+                  chain input {
+                          type filter hook input priority filter; policy drop;
+                          iif "lo" accept
+                          ct state established,related accept
+                          tcp dport 2222 accept
+                  }
+          }
+      notify: Redemarrer nftables
+    - name: Firewall - activer et demarrer nftables
+      systemd:
+        name: nftables
+        enabled: true
+        state: started
+  handlers:
+    - name: Redemarrer sshd
+      service:
+        name: sshd
+        state: restarted
+    - name: Recharger auditd
+      command: augenrules --load
+    - name: Redemarrer nftables
+      systemd:
+        name: nftables
+        state: restarted
